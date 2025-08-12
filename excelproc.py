@@ -6,6 +6,48 @@ import os
 import json
 from openai import OpenAI
 
+def _validate_ai_varieties(ai_varieties, original_text):
+    """
+    Validate that AI parsing results contain meaningful text from the original input.
+    Reject results that hallucinate completely unrelated variety names.
+    
+    Args:
+        ai_varieties: List of varieties returned by AI
+        original_text: Original input text
+    
+    Returns:
+        bool: True if results are valid, False if they appear to be hallucinated
+    """
+    if not ai_varieties or not isinstance(ai_varieties, list):
+        return False
+    
+    # If AI returned single item that matches original, always accept
+    if len(ai_varieties) == 1 and ai_varieties[0].strip() == original_text.strip():
+        return True
+    
+    # For multiple varieties, check if they contain meaningful content from original
+    original_words = set(original_text.lower().replace('.', '').replace(',', '').split())
+    
+    # Remove common filler words
+    filler_words = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'the', 'and', 'or'}
+    original_meaningful_words = original_words - filler_words
+    
+    if not original_meaningful_words:
+        # If original has no meaningful words, accept AI result
+        return True
+    
+    # Check if at least one AI variety contains meaningful words from original
+    for variety in ai_varieties:
+        variety_words = set(variety.lower().replace('.', '').replace(',', '').split())
+        variety_meaningful_words = variety_words - filler_words
+        
+        # If there's overlap in meaningful words, accept
+        if original_meaningful_words & variety_meaningful_words:
+            return True
+    
+    # No meaningful overlap found - likely hallucinated
+    return False
+
 def parse_varieties_with_openai(variety_text, client):
     """
     Use OpenAI GPT-3.5 Turbo to parse variety text and extract individual varieties.
@@ -18,21 +60,24 @@ def parse_varieties_with_openai(variety_text, client):
         return [variety_text]
     
     prompt = f"""
-Analyze the following plant variety text and extract individual varieties if multiple varieties are present.
+Analyze the following plant variety text and determine if it contains ONE variety or MULTIPLE varieties.
 
-Rules:
-1. If the text contains only ONE variety (like "3. JIW.1"), return it as a single item
-2. If the text contains MULTIPLE numbered varieties (like "1. SANEEN. 2. WQ 110" or "1. Lanet cocotype 2. Bisia ecohype 3. Kisia ecolipe"), extract each numbered variety separately
-3. Return the result as a JSON array of strings
-4. Keep the numbering (e.g., "1.", "2.", "3.") in the extracted varieties
-5. Remove any trailing periods from variety names
+CRITICAL RULES:
+1. ONLY split if you see CLEAR numbered patterns like "1. variety1 2. variety2" or "1. variety1, 2. variety2"
+2. If the text is a single variety name (even with numbers or hyphens like "BSCP 1-10" or "WQ-123"), return it as ONE item
+3. DO NOT invent or hallucinate variety names - only use text that appears in the input
+4. Numbers in variety names (like "BSCP 1-10", "variety-123") are part of the name, NOT separators
+5. Return the result as a JSON array of strings
+6. Be VERY conservative - when in doubt, return the original text as a single item
 
 Text to analyze: "{variety_text}"
 
 Examples:
-- Input: "3. JIW.1" → Output: ["3. JIW.1"]
-- Input: "wheat(T.A) : 1. SANEEN. 2. WQ 110" → Output: ["1. SANEEN", "2. WQ 110"]
-- Input: "Dolidos lablab Brachiaria nuzzizensis. 1. Lanet cocotype 2. Bisia ecohype 3. Kisia ecolipe" → Output: ["1. Lanet cocotype", "2. Bisia ecohype", "3. Kisia ecolipe"]
+- Input: "BSCP 1-10" → Output: ["BSCP 1-10"] (single variety with numbers in name)
+- Input: "variety-123" → Output: ["variety-123"] (single variety)  
+- Input: "3. JIW.1" → Output: ["3. JIW.1"] (single variety)
+- Input: "wheat(T.A) : 1. SANEEN. 2. WQ 110" → Output: ["1. SANEEN", "2. WQ 110"] (clear numbered pattern)
+- Input: "1. Lanet cocotype 2. Bisia ecohype 3. Kisia ecolipe" → Output: ["1. Lanet cocotype", "2. Bisia ecohype", "3. Kisia ecolipe"] (clear numbered pattern)
 
 Return only the JSON array, no other text.
 """
@@ -54,7 +99,11 @@ Return only the JSON array, no other text.
         try:
             varieties = json.loads(result_text)
             if isinstance(varieties, list) and len(varieties) > 0:
-                return varieties
+                # Validate that AI results contain text from original input
+                if _validate_ai_varieties(varieties, variety_text):
+                    return varieties
+                else:
+                    print(f"AI validation failed for '{variety_text}': {varieties}")
         except json.JSONDecodeError:
             # If JSON parsing fails, try to extract array from text
             import re
@@ -63,7 +112,11 @@ Return only the JSON array, no other text.
                 try:
                     varieties = json.loads(f'[{json_match.group(1)}]')
                     if isinstance(varieties, list) and len(varieties) > 0:
-                        return varieties
+                        # Validate that AI results contain text from original input
+                        if _validate_ai_varieties(varieties, variety_text):
+                            return varieties
+                        else:
+                            print(f"AI validation failed for '{variety_text}': {varieties}")
                 except json.JSONDecodeError:
                     pass
     
@@ -282,22 +335,40 @@ def split_latin_species_fallback(species_text, species_list):
     # Check for space-separated species using genus-species pattern
     # Look for pattern: "Genus species Genus species" etc.
     import re
-    # Pattern to match Latin species names (Capitalized word followed by lowercase word)
-    species_pattern = r'\b[A-Z][a-z]+\s+[a-z]+\b'
-    matches = re.findall(species_pattern, species_text)
     
-    if len(matches) > 1:
+    # Try to intelligently split based on known species patterns
+    potential_species = []
+    remaining_text = species_text
+    
+    # First, extract full species names (Genus species or Genus spp.)
+    full_species_pattern = r'\b[A-Z][a-z]+\s+(?:[a-z]+\.?|spp\.?)\b'
+    full_species_matches = re.findall(full_species_pattern, species_text)
+    
+    # Remove found full species from remaining text
+    for match in full_species_matches:
+        potential_species.append(match)
+        remaining_text = remaining_text.replace(match, ' ', 1)
+    
+    # Then look for standalone genus names in remaining text
+    genus_pattern = r'\b[A-Z][a-z]+\b'
+    genus_matches = re.findall(genus_pattern, remaining_text.strip())
+    
+    for genus in genus_matches:
+        if genus in species_list:  # Only add if it's a valid species (some genera are used as species names)
+            potential_species.append(genus)
+    
+    if len(potential_species) > 1:
         # Validate matches against known species list
         valid_matches = []
-        for match in matches:
-            if match in species_list:
-                valid_matches.append(match)
+        for species in potential_species:
+            if species in species_list:
+                valid_matches.append(species)
         
         if len(valid_matches) > 1:
             return valid_matches
-        elif len(matches) > 1:
-            # Even if not in species list, if we found multiple valid-looking species names, return them
-            return matches
+        elif len(potential_species) > 1:
+            # Even if not all in species list, if we found multiple valid-looking species names, return them
+            return potential_species
     
     # Return original text if no splitting occurred
     return [species_text]
